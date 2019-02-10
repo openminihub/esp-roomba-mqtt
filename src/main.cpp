@@ -3,7 +3,8 @@
 #include <ESP8266mDNS.h>
 #include <ArduinoOTA.h>
 #include <Roomba.h>
-#include <PubSubClient.h>
+#include <Ticker.h>
+#include <AsyncMqttClient.h>
 #include <ArduinoJson.h>
 #include "config.h"
 extern "C" {
@@ -19,6 +20,7 @@ extern "C" {
 RemoteDebug Debug;
 #else
 #define DLOG(msg, ...)
+#define VLOG(msg, ...)
 #endif
 
 // Roomba setup
@@ -62,9 +64,62 @@ WiFiClient wifiClient;
 bool OTAStarted;
 
 // MQTT setup
-PubSubClient mqttClient(wifiClient);
+AsyncMqttClient mqttClient;
+Ticker mqttReconnectTimer;
+
+WiFiEventHandler wifiConnectHandler;
+WiFiEventHandler wifiDisconnectHandler;
+Ticker wifiReconnectTimer;
+
 const PROGMEM char *commandTopic = MQTT_COMMAND_TOPIC;
 const PROGMEM char *statusTopic = MQTT_STATE_TOPIC;
+
+void connectToWifi() {
+  Serial.println("Connecting to Wi-Fi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void onWifiConnect(const WiFiEventStationModeGotIP& event) {
+  DLOG("Connected to Wi-Fi.");
+  connectToMqtt();
+}
+
+void onWifiDisconnect(const WiFiEventStationModeDisconnected& event) {
+  DLOG("Disconnected from Wi-Fi.");
+  mqttReconnectTimer.detach(); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+  wifiReconnectTimer.once(2, connectToWifi);
+}
+
+void connectToMqtt() {
+  DLOG("Connecting to MQTT...");
+  mqttClient.connect();
+}
+
+void onMqttConnect(bool sessionPresent) {
+  DEBUG("Connected to MQTT.");
+  uint16_t packetIdSub = mqttClient.subscribe(commandTopic, 2); //QoS=2
+  mqttClient.publish(statusTopic, 0, true, "Hello");
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  DLOG("Disconnected from MQTT.");
+
+  if (WiFi.isConnected()) {
+    mqttReconnectTimer.once(2, connectToMqtt);
+  }
+}
+
+void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
+  DLOG("Subscribe acknowledged.\n");
+}
+
+void onMqttUnsubscribe(uint16_t packetId) {
+  DLOG("Unsubscribe acknowledged.\n");
+}
+
+void onMqttPublish(uint16_t packetId) {
+  DLOG("Publish acknowledged.\n");
+}
 
 void wakeup() {
   DLOG("Wakeup Roomba\n");
@@ -138,13 +193,13 @@ bool performCommand(const char *cmdchar) {
   return true;
 }
 
-void mqttCallback(char *topic, byte *payload, unsigned int length) {
+void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
   DLOG("Received mqtt callback for topic %s\n", topic);
   if (strcmp(commandTopic, topic) == 0) {
     // turn payload into a null terminated string
-    char *cmd = (char *)malloc(length + 1);
-    memcpy(cmd, payload, length);
-    cmd[length] = 0;
+    char *cmd = (char *)malloc(len + 1);
+    memcpy(cmd, payload, len);
+    cmd[len] = 0;
 
     if(!performCommand(cmd)) {
       DLOG("Unknown command %s\n", cmd);
@@ -178,7 +233,8 @@ void debugCallback() {
     DLOG("Resetting Roomba\n");
     roomba.reset();
   } else if (cmd == "mqtthello") {
-    mqttClient.publish("vacuum/hello", "hello there");
+//    mqttClient.publish("vacuum/hello", "hello there");
+    mqttClient.publish("vacuum/hello", 0, true, "hello there");
   } else if (cmd == "version") {
     const char compile_date[] = __DATE__ " " __TIME__;
     DLOG("Compiled on: %s\n", compile_date);
@@ -246,7 +302,8 @@ void sleepIfNecessary() {
       root["charge"] = 0;
       String jsonStr;
       root.printTo(jsonStr);
-      mqttClient.publish(statusTopic, jsonStr.c_str(), true);
+//      mqttClient.publish(statusTopic, jsonStr.c_str(), true);
+      mqttClient.publish(statusTopic, 0, true, jsonStr.c_str());
     }
     delay(200);
 
@@ -353,10 +410,22 @@ void setup() {
   // Sleep immediately if ENABLE_ADC_SLEEP and the battery is low
   sleepIfNecessary();
 
+  wifiConnectHandler = WiFi.onStationModeGotIP(onWifiConnect);
+  wifiDisconnectHandler = WiFi.onStationModeDisconnected(onWifiDisconnect);
+
+  mqttClient.onConnect(onMqttConnect);
+  mqttClient.onDisconnect(onMqttDisconnect);
+  mqttClient.onSubscribe(onMqttSubscribe);
+  mqttClient.onUnsubscribe(onMqttUnsubscribe);
+  mqttClient.onMessage(onMqttMessage);
+  mqttClient.onPublish(onMqttPublish);
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCredentials(MQTT_USER, MQTT_PASSWORD);
+
   // Set Hostname.
   String hostname(HOSTNAME);
   WiFi.hostname(hostname);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  connectToWifi();
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -365,9 +434,6 @@ void setup() {
   ArduinoOTA.setHostname((const char *)hostname.c_str());
   ArduinoOTA.begin();
   ArduinoOTA.onStart(onOTAStart);
-
-  mqttClient.setServer(MQTT_SERVER, 1883);
-  mqttClient.setCallback(mqttCallback);
 
   #if LOGGING
   Debug.begin((const char *)hostname.c_str());
@@ -385,17 +451,6 @@ void setup() {
 
   // Request sensor stream
   roomba.stream(sensors, sizeof(sensors));
-}
-
-void reconnect() {
-  DLOG("Attempting MQTT connection...\n");
-  // Attempt to connect
-  if (mqttClient.connect(HOSTNAME, MQTT_USER, MQTT_PASSWORD)) {
-    DLOG("MQTT connected\n");
-    mqttClient.subscribe(commandTopic);
-  } else {
-    DLOG("MQTT failed rc=%d try again in 5 seconds\n", mqttClient.state());
-  }
 }
 
 void sendStatus() {
@@ -417,12 +472,11 @@ void sendStatus() {
   root["charge"] = roombaState.charge;
   String jsonStr;
   root.printTo(jsonStr);
-  mqttClient.publish(statusTopic, jsonStr.c_str());
+  mqttClient.publish(statusTopic, 0, true, jsonStr.c_str());
 }
 
 int lastStateMsgTime = 0;
 int lastWakeupTime = 0;
-int lastConnectTime = 0;
 
 void loop() {
   // Important callbacks that _must_ happen every cycle
@@ -436,12 +490,6 @@ void loop() {
   }
 
   long now = millis();
-  // If MQTT client can't connect to broker, then reconnect
-  if (!mqttClient.connected() && (now - lastConnectTime) > 5000) {
-    DLOG("Reconnecting MQTT\n");
-    lastConnectTime = now;
-    reconnect();
-  }
   // Wakeup the roomba at fixed intervals
   if (now - lastWakeupTime > 50000) {
     lastWakeupTime = now;
@@ -471,5 +519,4 @@ void loop() {
   }
 
   readSensorPacket();
-  mqttClient.loop();
 }
